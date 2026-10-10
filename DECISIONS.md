@@ -14,3 +14,6 @@ I drive the department summary pipeline starting from the `employees` collection
 
 5. **One thing you would change for 100x the data.**
 I would shard `attendance_logs` using a compound shard key on `(emp_code, date)` and maintain pre-aggregated daily/monthly department rollup collections, avoiding expensive real-time cross-collection `$lookup` joins across tens of millions of raw punch records.
+
+6. **Moving Average Calculation (Engineering Choice).**
+In `department_trend`, MongoDB's window aggregation `$avg` computes the 7-day moving average directly across unrounded mathematical attendance rates (`present_count / headcount`), applying 4-decimal half-up rounding on output serialization. Averaging exact division values rather than prematurely rounded intermediate figures avoids accumulating rounding bias across the moving window.

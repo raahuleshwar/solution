@@ -423,13 +423,7 @@ def punch_out(body: PunchOutIn):
         sort=[("punch_in", -1)],
     )
 
-    if not latest or latest.get("punch_in") is None:
-        future = db.attendance_logs.find_one(
-            {"emp_code": body.emp_code, "punch_in": {"$gt": punch_out_dt}},
-            sort=[("punch_in", 1)],
-        )
-        if future:
-            raise HTTPException(status_code=422, detail="punched_at must be strictly greater than punch_in")
+    if not latest:
         raise HTTPException(status_code=404, detail="No punch-in found for this punch-out")
 
     if latest.get("punch_out") is not None:
@@ -632,6 +626,9 @@ def regularize_attendance(emp_code: str, date_str: str, body: RegularizeIn):
     )
     update_filter = {
         "_id": record["_id"],
+        "status": old_status,
+        "punch_in": old_punch_in,
+        "punch_out": old_punch_out,
         **history_cond,
     }
 

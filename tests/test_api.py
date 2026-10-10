@@ -215,10 +215,14 @@ async def test_punch_out_rules_and_concurrency():
         assert res_in.status_code == 201
         assert res_in.json()["late_minutes"] == 35
 
-        # Punch out before punch in -> 422
+        # Punch out before punch in -> 404 (no record at or before punched_at)
         t_early = t_in - 10000
         res_early = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0003", "punched_at": t_early})
-        assert res_early.status_code == 422
+        assert res_early.status_code == 404
+
+        # Punch out equal to punch in -> 422 (punched_at <= punch_in)
+        res_equal = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0003", "punched_at": t_in})
+        assert res_equal.status_code == 422
 
         # Punch out > 24 hours after punch in -> 422
         t_late24 = t_in + 86401 * 1000

@@ -48,6 +48,11 @@ pip install pytest pytest-asyncio httpx
 PYTHONPATH=. pytest -v tests/
 ```
 
+## Key Design Decisions & Notes
+- **Moving Average Calculation**: The 7-day moving average in `/analytics/departments/{department}/trend` computes the mean over unrounded mathematical rates (`present_count / headcount`) and applies 4-decimal half-up rounding (`ROUND_HALF_UP`) on output serialization, preventing intermediate rounding errors from skewing window averages.
+- **Race Safety**: Concurrency is handled at the database level via a unique compound index on `(emp_code, date)` for punch-in, atomic conditional `find_one_and_update` for punch-out, and optimistic concurrency check on `_id`, `status`, `punch_in`, `punch_out`, and `history` length for regularization.
+- **Explain Plans**: All analytics and query endpoints are verified with MongoDB's `explain("executionStats")` to execute via index scans (`IXSCAN`) without full collection scans (`COLLSCAN`).
+
 ## Repository Structure
 
 - `app/main.py`: Complete application code with routes, models, business rule calculations, and MongoDB aggregation pipelines.

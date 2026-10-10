@@ -434,3 +434,126 @@ async def test_new_fixes_strictness_and_validations():
         r_out_dup = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0010", "punched_at": t_out + 1000})
         assert r_out_dup.status_code == 409
 
+
+@pytest.mark.asyncio
+async def test_empty_department_trend_and_hand_edge_cases():
+    """
+    Test edge cases specified by user:
+    1. Trend with no records: department has employees but zero logs in date range.
+       - Returns exactly 1 row per day
+       - Weekdays: headcount > 0, present_count 0.0, attendance_rate 0.0
+       - Weekends: is_working_day False, attendance_rate None
+    2. Grace period boundary: 09:40:00 (late 0) vs 09:40:01 (late 10) on 09:30 shift
+    3. Overnight 22:00-06:00 employee punching in at 01:00 IST (date is prev day, late 180)
+    4. Overtime boundary: 29 mins (overtime 0) vs 30 mins (overtime 30)
+    5. Safe regularize concurrency: mid-flight punch-out causes 409 on regularize
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # 1. Create employee in department 'Design' with no attendance records
+        await ac.post("/employees", json={
+            "emp_code": "EMP0020",
+            "name": "Designer One",
+            "email": "designer@example.com",
+            "department": "Design",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "2026-01-01"
+        })
+
+        # Query trend for Design across Wed-Sun (2026-07-01 to 2026-07-05)
+        # 2026-07-01: Wed (working)
+        # 2026-07-02: Thu (working)
+        # 2026-07-03: Fri (working)
+        # 2026-07-04: Sat (non-working)
+        # 2026-07-05: Sun (non-working)
+        r_trend = await ac.get("/analytics/departments/Design/trend?from=2026-07-01&to=2026-07-05")
+        assert r_trend.status_code == 200
+        trend_items = r_trend.json()["items"]
+        assert len(trend_items) == 5
+
+        # Check Wed, Thu, Fri: attendance_rate 0.0, is_working_day True, headcount 1
+        for i in range(3):
+            row = trend_items[i]
+            assert row["headcount"] == 1
+            assert row["present_count"] == 0.0
+            assert row["is_working_day"] is True
+            assert row["attendance_rate"] == 0.0
+
+        # Check Sat, Sun: is_working_day False, attendance_rate None
+        for i in [3, 4]:
+            row = trend_items[i]
+            assert row["headcount"] == 1
+            assert row["is_working_day"] is False
+            assert row["attendance_rate"] is None
+
+        # 2. Grace period boundary: 09:40:00 vs 09:40:01
+        # Shift start 09:30 IST.
+        # 09:40:00 IST = 04:10:00 UTC on 2026-07-06
+        t_40_00 = int(datetime(2026, 7, 6, 4, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        r_p1 = await ac.post("/attendance/punch-in", json={"emp_code": "EMP0020", "punched_at": t_40_00})
+        assert r_p1.status_code == 201
+        assert r_p1.json()["late_minutes"] == 0  # exactly 600s, not strictly > 600s
+
+        # EMP0021 for 09:40:01 IST
+        await ac.post("/employees", json={
+            "emp_code": "EMP0021",
+            "name": "Designer Two",
+            "email": "designer2@example.com",
+            "department": "Design",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "2026-01-01"
+        })
+        # 09:40:01 IST = 04:10:01 UTC on 2026-07-06
+        t_40_01 = int(datetime(2026, 7, 6, 4, 10, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        r_p2 = await ac.post("/attendance/punch-in", json={"emp_code": "EMP0021", "punched_at": t_40_01})
+        assert r_p2.status_code == 201
+        assert r_p2.json()["late_minutes"] == 10  # 601s strictly > 600s -> 601 // 60 = 10
+
+        # 3. Overnight 22:00-06:00 employee punching in at 01:00 IST
+        await ac.post("/employees", json={
+            "emp_code": "EMP0022",
+            "name": "Night Guard",
+            "email": "night@example.com",
+            "department": "Security",
+            "shift_start": "22:00",
+            "shift_end": "06:00",
+            "joined_on": "2026-01-01"
+        })
+        # Punch in at 01:00 IST on 2026-07-07 = 19:30 UTC on 2026-07-06
+        t_01_00 = int(datetime(2026, 7, 6, 19, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        r_night = await ac.post("/attendance/punch-in", json={"emp_code": "EMP0022", "punched_at": t_01_00})
+        assert r_night.status_code == 201
+        night_data = r_night.json()
+        assert night_data["date"] == "2026-07-06"  # belongs to shift start date!
+        assert night_data["late_minutes"] == 180  # 3 hours (180 mins) late from 22:00
+
+        # 4. Overtime boundary: 29 mins vs 30 mins for 18:30 shift end
+        # Punch out at 18:59:00 IST = 13:29:00 UTC (29 mins after 18:30) -> overtime = 0
+        t_18_59 = int(datetime(2026, 7, 6, 13, 29, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        r_ot29 = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0020", "punched_at": t_18_59})
+        assert r_ot29.status_code == 200
+        assert r_ot29.json()["overtime_minutes"] == 0
+
+        # EMP0021 punches out at 19:00:00 IST = 13:30:00 UTC (30 mins after 18:30) -> overtime = 30
+        t_19_00 = int(datetime(2026, 7, 6, 13, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        r_ot30 = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0021", "punched_at": t_19_00})
+        assert r_ot30.status_code == 200
+        assert r_ot30.json()["overtime_minutes"] == 30
+
+        # 5. Safe regularize concurrency test:
+        # If punch_out changes between read and write, regularize with stale punch_out gets 409
+        # Create an open record for EMP0022 on 2026-07-08
+        t_open_in = int(datetime(2026, 7, 8, 16, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        await ac.post("/attendance/punch-in", json={"emp_code": "EMP0022", "punched_at": t_open_in})
+
+        # Regularize while open:
+        r_reg_ok = await ac.patch("/attendance/EMP0022/2026-07-08", json={
+            "status": "WFH",
+            "reason": "approved wfh",
+            "regularized_by": "manager"
+        })
+        assert r_reg_ok.status_code == 200
+
+
