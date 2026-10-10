@@ -13,3 +13,4 @@ htmlcov/
 !.env.example
 .DS_Store
 *.log
+*.docx

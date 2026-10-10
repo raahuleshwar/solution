@@ -5,15 +5,18 @@ Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
 import calendar
+import json
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -27,6 +30,23 @@ client = MongoClient(MONGO_URI, tz_aware=True)
 db = client[MONGO_DB]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+YMD = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_ymd(s: str) -> date:
+    """Strictly parse a date in YYYY-MM-DD format, raising 422 on failure."""
+    if not YMD.match(s):
+        raise HTTPException(status_code=422, detail="date must be YYYY-MM-DD")
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="invalid date")
+
+
+def clean(x: Any) -> Any:
+    """Normalize BSON types (like BSON Timestamp) to standard JSON-serializable primitives."""
+    return json.loads(json_util.dumps(x))
 
 
 def init_db():
@@ -262,36 +282,36 @@ class EmployeeIn(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def validate_joined_on(cls, v: str) -> str:
+        if not YMD.match(v):
+            raise ValueError("joined_on must be YYYY-MM-DD")
         try:
             date.fromisoformat(v)
         except ValueError:
-            raise ValueError("joined_on must be a valid date YYYY-MM-DD")
+            raise ValueError("invalid date")
         return v
 
-    @field_validator("shift_end")
-    @classmethod
-    def validate_shift_times(cls, v: str, info) -> str:
-        shift_start = info.data.get("shift_start")
-        if shift_start is not None and v == shift_start:
+    @model_validator(mode="after")
+    def check_shift(self):
+        if self.shift_start == self.shift_end:
             raise ValueError("shift_start must differ from shift_end")
-        return v
+        return self
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
     status: str = Field("PRESENT", pattern=r"^(PRESENT|WFH|ON_DUTY)$")
 
 
 class PunchOutIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punched_at: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
 
 
 class RegularizeIn(BaseModel):
     status: Optional[str] = Field(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$")
-    punch_in: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
-    punch_out: Optional[int] = Field(None, ge=100000000000, le=4102444800000)
+    punch_in: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
+    punch_out: Optional[int] = Field(None, strict=True, ge=100000000000, le=4102444800000)
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
 
@@ -397,14 +417,23 @@ def punch_out(body: PunchOutIn):
     else:
         punch_out_dt = truncate_datetime_to_seconds(datetime.now(timezone.utc))
 
-    # Find the employee's most recent record
+    # Find the employee's most recent record whose punch_in is at or before punched_at
     latest = db.attendance_logs.find_one(
-        {"emp_code": body.emp_code},
+        {"emp_code": body.emp_code, "punch_in": {"$lte": punch_out_dt}},
         sort=[("punch_in", -1)],
     )
 
     if not latest or latest.get("punch_in") is None:
+        future = db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$gt": punch_out_dt}},
+            sort=[("punch_in", 1)],
+        )
+        if future:
+            raise HTTPException(status_code=422, detail="punched_at must be strictly greater than punch_in")
         raise HTTPException(status_code=404, detail="No punch-in found for this punch-out")
+
+    if latest.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="Record is already punched out")
 
     punch_in_dt = latest["punch_in"]
     if punch_in_dt.tzinfo is None:
@@ -416,9 +445,6 @@ def punch_out(body: PunchOutIn):
         raise HTTPException(status_code=422, detail="punched_at must be strictly greater than punch_in")
     if diff_sec > 86400:
         raise HTTPException(status_code=422, detail="punched_at cannot be more than 24 hours after punch_in")
-
-    if latest.get("punch_out") is not None:
-        raise HTTPException(status_code=409, detail="Record is already punched out")
 
     shift_start = emp.get("shift_start", "09:30")
     shift_end = emp.get("shift_end", "18:30")
@@ -450,9 +476,9 @@ def punch_out(body: PunchOutIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
@@ -460,7 +486,14 @@ def list_attendance(
     List attendance records: paginated, sorted by date desc then emp_code asc.
     Indexed query without loading whole collection into memory.
     """
-    if date_from and date_to and date_from > date_to:
+    d_from: Optional[date] = None
+    d_to: Optional[date] = None
+    if date_from:
+        d_from = parse_ymd(date_from)
+    if date_to:
+        d_to = parse_ymd(date_to)
+
+    if d_from and d_to and d_from > d_to:
         raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
 
     q: Dict[str, Any] = {}
@@ -494,10 +527,7 @@ def regularize_attendance(emp_code: str, date_str: str, body: RegularizeIn):
     Regularize (manually correct) one day's record:
     Recompute derived fields and append to history.
     """
-    try:
-        date.fromisoformat(date_str)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid date format in path")
+    parse_ymd(date_str)
 
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
@@ -748,20 +778,9 @@ def build_department_summary_pipeline(month: str, department: Optional[str] = No
         {
             "$lookup": {
                 "from": "attendance_logs",
-                "let": {"emp": "$emp_code"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$emp_code", "$$emp"]},
-                                    {"$gte": ["$date", start_date]},
-                                    {"$lte": ["$date", end_date]},
-                                ]
-                            }
-                        }
-                    }
-                ],
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "pipeline": [{"$match": {"date": {"$gte": start_date, "$lte": end_date}}}],
                 "as": "logs",
             }
         },
@@ -1096,11 +1115,8 @@ def department_trend(
     if not dept_exists:
         raise HTTPException(status_code=404, detail="Department not found")
 
-    try:
-        d_from = date.fromisoformat(from_date)
-        d_to = date.fromisoformat(to_date)
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid date format")
+    d_from = parse_ymd(from_date)
+    d_to = parse_ymd(to_date)
 
     if d_to < d_from:
         raise HTTPException(status_code=422, detail="'to' must be on or after 'from'")
@@ -1137,9 +1153,9 @@ def explain_endpoint(
     month: Optional[str] = Query(None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     department: Optional[str] = None,
     limit: int = Query(10, ge=1, le=50),
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
+    date_from: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    date_to: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    status: Optional[str] = Query(None, pattern=r"^(PRESENT|ABSENT|LEAVE|WFH|ON_DUTY)$"),
     from_date: Optional[str] = Query(None, alias="from"),
     to_date: Optional[str] = Query(None, alias="to"),
     page: int = Query(1, ge=1),
@@ -1159,7 +1175,9 @@ def explain_endpoint(
         raise HTTPException(status_code=422, detail=f"Unknown endpoint '{endpoint}'. Must be one of {valid_endpoints}")
 
     if endpoint == "attendance_list":
-        if date_from and date_to and date_from > date_to:
+        d_from = parse_ymd(date_from) if date_from else None
+        d_to = parse_ymd(date_to) if date_to else None
+        if d_from and d_to and d_from > d_to:
             raise HTTPException(status_code=422, detail="date_from must be on or before date_to")
         q: Dict[str, Any] = {}
         if emp_code:
@@ -1185,7 +1203,7 @@ def explain_endpoint(
             },
             verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": clean(explain_res)}
 
     elif endpoint == "employee_monthly":
         if not emp_code:
@@ -1199,7 +1217,7 @@ def explain_endpoint(
             {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
             verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": clean(explain_res)}
 
     elif endpoint == "department_summary":
         if not month:
@@ -1211,7 +1229,7 @@ def explain_endpoint(
             {"aggregate": "employees", "pipeline": pipeline, "cursor": {}},
             verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "employees", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": "employees", "explain": clean(explain_res)}
 
     elif endpoint == "late_leaderboard":
         if not month:
@@ -1223,7 +1241,7 @@ def explain_endpoint(
             {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
             verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": clean(explain_res)}
 
     elif endpoint == "department_trend":
         if not department:
@@ -1231,11 +1249,8 @@ def explain_endpoint(
         if not from_date or not to_date:
             raise HTTPException(status_code=422, detail="'from' and 'to' are required for department_trend")
 
-        try:
-            d_from = date.fromisoformat(from_date)
-            d_to = date.fromisoformat(to_date)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Invalid date format")
+        d_from = parse_ymd(from_date)
+        d_to = parse_ymd(to_date)
 
         if d_to < d_from:
             raise HTTPException(status_code=422, detail="'to' must be on or after 'from'")
@@ -1248,4 +1263,4 @@ def explain_endpoint(
             {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}},
             verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_res}
+        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": clean(explain_res)}

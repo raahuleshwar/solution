@@ -316,3 +316,121 @@ async def test_regularize_validation_errors():
             "regularized_by": "admin"
         })
         assert r3.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_new_fixes_strictness_and_validations():
+    """
+    Test Fixes 1 to 6:
+    - Fix 1: strict=True rejects floats and strings in timestamps
+    - Fix 3 & 4: strict YYYY-MM-DD validation and pattern checks
+    - Fix 6: shift_start == shift_end caught even when shift_end uses default
+    - Fix 2: punch-out record matching and 409/422/404 ordering
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # Fix 6: shift_start == "18:30" with omitted shift_end (default "18:30") -> 422
+        r_shift = await ac.post("/employees", json={
+            "emp_code": "EMP0010",
+            "name": "Shift Tester",
+            "email": "shift@example.com",
+            "department": "Engineering",
+            "shift_start": "18:30",  # same as default shift_end
+            "joined_on": "2026-01-01"
+        })
+        assert r_shift.status_code == 422
+
+        # Fix 4: joined_on non-hyphenated 20260105 -> 422
+        r_join = await ac.post("/employees", json={
+            "emp_code": "EMP0010",
+            "name": "Join Tester",
+            "email": "join@example.com",
+            "department": "Engineering",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "20260105"
+        })
+        assert r_join.status_code == 422
+
+        # Create valid employee
+        r_ok = await ac.post("/employees", json={
+            "emp_code": "EMP0010",
+            "name": "Valid Emp",
+            "email": "valid@example.com",
+            "department": "Engineering",
+            "shift_start": "09:30",
+            "shift_end": "18:30",
+            "joined_on": "2026-01-01"
+        })
+        assert r_ok.status_code == 201
+
+        # Fix 1: float timestamp in punch-in -> 422
+        r_flt_in = await ac.post("/attendance/punch-in", json={
+            "emp_code": "EMP0010",
+            "punched_at": 1783312500000.0,
+        })
+        assert r_flt_in.status_code == 422
+
+        # Fix 1: string timestamp in punch-in -> 422
+        r_str_in = await ac.post("/attendance/punch-in", json={
+            "emp_code": "EMP0010",
+            "punched_at": "1783312500000",
+        })
+        assert r_str_in.status_code == 422
+
+        # Valid punch-in at 09:30 IST on 2026-07-06
+        t_in = int(datetime(2026, 7, 6, 4, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        r_in = await ac.post("/attendance/punch-in", json={"emp_code": "EMP0010", "punched_at": t_in})
+        assert r_in.status_code == 201
+
+        # Fix 1: float timestamp in punch-out -> 422
+        r_flt_out = await ac.post("/attendance/punch-out", json={
+            "emp_code": "EMP0010",
+            "punched_at": 1783312500000.0,
+        })
+        assert r_flt_out.status_code == 422
+
+        # Fix 1: float timestamp in regularize -> 422
+        r_flt_reg = await ac.patch("/attendance/EMP0010/2026-07-06", json={
+            "punch_in": float(t_in),
+            "reason": "float test",
+            "regularized_by": "admin"
+        })
+        assert r_flt_reg.status_code == 422
+
+        # Fix 3 & 4: GET /attendance date validation
+        r_att_inv1 = await ac.get("/attendance?date_from=2026-13-45")
+        assert r_att_inv1.status_code == 422
+
+        r_att_inv2 = await ac.get("/attendance?date_from=20260105")
+        assert r_att_inv2.status_code == 422
+
+        r_att_inv3 = await ac.get("/attendance?status=INVALID_STATUS")
+        assert r_att_inv3.status_code == 422
+
+        # Fix 4: PATCH /attendance with invalid path date
+        r_reg_inv = await ac.patch("/attendance/EMP0010/2026-02-31", json={
+            "reason": "bad date",
+            "regularized_by": "admin"
+        })
+        assert r_reg_inv.status_code == 422
+
+        # Fix 4: Trend endpoint with invalid date
+        r_trend_inv = await ac.get("/analytics/departments/Engineering/trend?from=2026-13-45&to=2026-07-08")
+        assert r_trend_inv.status_code == 422
+
+        # Fix 4: Explain endpoint with invalid date
+        r_exp_inv = await ac.get("/admin/explain/attendance_list?date_from=2026-13-45")
+        assert r_exp_inv.status_code == 422
+
+        r_exp_inv2 = await ac.get("/admin/explain/department_trend?department=Engineering&from=20260105&to=2026-07-08")
+        assert r_exp_inv2.status_code == 422
+
+        # Fix 2: Punch-out validation order: already punched out -> 409
+        t_out = t_in + (9 * 3600 * 1000)
+        r_out1 = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0010", "punched_at": t_out})
+        assert r_out1.status_code == 200
+
+        r_out_dup = await ac.post("/attendance/punch-out", json={"emp_code": "EMP0010", "punched_at": t_out + 1000})
+        assert r_out_dup.status_code == 409
+
